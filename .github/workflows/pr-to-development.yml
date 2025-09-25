@@ -24,10 +24,6 @@ jobs:
       issues: write         # required to add labels and assignees
 
     steps:
-      # Checkout is not strictly required for API operations, but included
-      # as requested and to provide a working copy if needed later.
-      - name: Checkout repository
-        uses: actions/checkout@v3
 
       - name: Create or ensure PR from source to development
         # Use GitHub Script for concise GitHub API interactions
@@ -74,7 +70,74 @@ jobs:
             });
 
             if (existing.length > 0) {
-              core.info(`Found existing PR #${existing[0].number} from ${headLabel} to ${baseBranch}. Skipping creation.`);
+              const existingPr = existing[0];
+              core.info(`Found existing PR #${existingPr.number} from ${headLabel} to ${baseBranch}. Will sync metadata.`);
+
+              // Update title/body/draft to mirror the source PR
+              await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: existingPr.number,
+                title: fullPr.title,
+                body: fullPr.body || '',
+                draft: !!fullPr.draft,
+              });
+
+              // Sync labels exactly (replace)
+              const labels = (fullPr.labels || [])
+                .map(l => (typeof l === 'string' ? l : l?.name))
+                .filter(Boolean);
+              await github.rest.issues.setLabels({
+                owner,
+                repo,
+                issue_number: existingPr.number,
+                labels: labels,
+              });
+
+              // Sync assignees exactly (replace)
+              const assignees = (fullPr.assignees || []).map(u => u.login);
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existingPr.number,
+                assignees,
+              });
+
+              // Sync requested reviewers (remove all, then add current ones)
+              try {
+                const { data: existingFull } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: existingPr.number,
+                });
+                const existingUserReviewers = (existingFull.requested_reviewers || []).map(u => u.login);
+                const existingTeamReviewers = (existingFull.requested_teams || []).map(t => t.slug);
+                if (existingUserReviewers.length > 0 || existingTeamReviewers.length > 0) {
+                  await github.rest.pulls.removeRequestedReviewers({
+                    owner,
+                    repo,
+                    pull_number: existingPr.number,
+                    reviewers: existingUserReviewers,
+                    team_reviewers: existingTeamReviewers,
+                  });
+                }
+
+                const reviewers = (fullPr.requested_reviewers || []).map(u => u.login);
+                const team_reviewers = (fullPr.requested_teams || []).map(t => t.slug);
+                if (reviewers.length > 0 || team_reviewers.length > 0) {
+                  await github.rest.pulls.requestReviewers({
+                    owner,
+                    repo,
+                    pull_number: existingPr.number,
+                    reviewers,
+                    team_reviewers,
+                  });
+                }
+              } catch (err) {
+                core.warning(`Unable to sync reviewers: ${err.message}`);
+              }
+
+              core.info('Existing PR synchronized with source PR metadata.');
               return;
             }
 
