@@ -1,0 +1,201 @@
+name: Create PR to development
+
+# This workflow mirrors a PR targeting `integration` by opening a corresponding
+# PR from the same source branch to `development`, copying metadata and avoiding
+# duplicates.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+    # Only run when the PR's base (target) branch is `integration`.
+    branches:
+      - integration
+
+jobs:
+  create-pr-to-development:
+    # Skip the entire job if the source branch indicates it's already intended
+    # for integration (e.g., "feature-x-to-int" or "hotfix/for-int").
+    if: ${{ !contains(github.head_ref, '-to-int') && !contains(github.head_ref, 'for-int') }}
+    runs-on: ubuntu-latest
+
+    # Grant only the minimum required permissions.
+    permissions:
+      contents: read        # required to read repository data
+      pull-requests: write  # required to create PRs and request reviewers
+      issues: write         # required to add labels and assignees
+
+    steps:
+
+      - name: Create or ensure PR from source to development
+        # Use GitHub Script for concise GitHub API interactions
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Collect the current PR context
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.info('No pull_request context found. Exiting.');
+              return;
+            }
+
+            // Defensive check: ensure base is integration
+            if (pr.base?.ref !== 'integration') {
+              core.info(`PR base is '${pr.base?.ref}', not 'integration'. Exiting.`);
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // For cross-fork PRs, head.label is 'forkOwner:branch'; this format
+            // is accepted by the create/list PR APIs for the 'head' parameter.
+            const headLabel = pr.head.label; // 'ownerOrFork:branch'
+            const baseBranch = 'development';
+
+            // Fetch full PR details to ensure complete metadata (labels, assignees, reviewers)
+            const { data: fullPr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pr.number,
+            });
+
+            // Avoid duplicates: check for an existing open PR from the same source branch to 'development'
+            const { data: existing } = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'open',
+              head: headLabel, // 'owner:branch'
+              base: baseBranch,
+              per_page: 100,
+            });
+
+            if (existing.length > 0) {
+              const existingPr = existing[0];
+              core.info(`Found existing PR #${existingPr.number} from ${headLabel} to ${baseBranch}. Will sync metadata.`);
+
+              // Update title/body/draft to mirror the source PR
+              await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: existingPr.number,
+                title: fullPr.title,
+                body: fullPr.body || '',
+                draft: !!fullPr.draft,
+              });
+
+              // Sync labels exactly (replace)
+              const labels = (fullPr.labels || [])
+                .map(l => (typeof l === 'string' ? l : l?.name))
+                .filter(Boolean);
+              await github.rest.issues.setLabels({
+                owner,
+                repo,
+                issue_number: existingPr.number,
+                labels: labels,
+              });
+
+              // Sync assignees exactly (replace)
+              const assignees = (fullPr.assignees || []).map(u => u.login);
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existingPr.number,
+                assignees,
+              });
+
+              // Sync requested reviewers (remove all, then add current ones)
+              try {
+                const { data: existingFull } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: existingPr.number,
+                });
+                const existingUserReviewers = (existingFull.requested_reviewers || []).map(u => u.login);
+                const existingTeamReviewers = (existingFull.requested_teams || []).map(t => t.slug);
+                if (existingUserReviewers.length > 0 || existingTeamReviewers.length > 0) {
+                  await github.rest.pulls.removeRequestedReviewers({
+                    owner,
+                    repo,
+                    pull_number: existingPr.number,
+                    reviewers: existingUserReviewers,
+                    team_reviewers: existingTeamReviewers,
+                  });
+                }
+
+                const reviewers = (fullPr.requested_reviewers || []).map(u => u.login);
+                const team_reviewers = (fullPr.requested_teams || []).map(t => t.slug);
+                if (reviewers.length > 0 || team_reviewers.length > 0) {
+                  await github.rest.pulls.requestReviewers({
+                    owner,
+                    repo,
+                    pull_number: existingPr.number,
+                    reviewers,
+                    team_reviewers,
+                  });
+                }
+              } catch (err) {
+                core.warning(`Unable to sync reviewers: ${err.message}`);
+              }
+
+              core.info('Existing PR synchronized with source PR metadata.');
+              return;
+            }
+
+            // Create the corresponding PR to 'development'
+            const { data: newPr } = await github.rest.pulls.create({
+              owner,
+              repo,
+              title: fullPr.title,
+              head: headLabel,      // keep same source branch
+              base: baseBranch,     // target development
+              body: fullPr.body || '',
+              draft: !!fullPr.draft,
+              maintainer_can_modify: true,
+            });
+
+            core.info(`Created PR #${newPr.number} from ${headLabel} to ${baseBranch}.`);
+
+            // Copy labels (best-effort)
+            const labels = (fullPr.labels || [])
+              .map(l => (typeof l === 'string' ? l : l?.name))
+              .filter(Boolean);
+            if (labels.length > 0) {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: newPr.number,
+                labels,
+              });
+            }
+
+            // Copy assignees (best-effort)
+            const assignees = (fullPr.assignees || []).map(u => u.login);
+            if (assignees.length > 0) {
+              await github.rest.issues.addAssignees({
+                owner,
+                repo,
+                issue_number: newPr.number,
+                assignees,
+              });
+            }
+
+            // Copy requested reviewers (users and teams) - best-effort, may fail on forks/permissions
+            try {
+              const reviewers = (fullPr.requested_reviewers || []).map(u => u.login);
+              const team_reviewers = (fullPr.requested_teams || []).map(t => t.slug);
+              if (reviewers.length > 0 || team_reviewers.length > 0) {
+                await github.rest.pulls.requestReviewers({
+                  owner,
+                  repo,
+                  pull_number: newPr.number,
+                  reviewers,
+                  team_reviewers,
+                });
+              }
+            } catch (err) {
+              core.warning(`Unable to set reviewers: ${err.message}`);
+            }
+
+            core.info('Mirroring to development completed.');
+
+
